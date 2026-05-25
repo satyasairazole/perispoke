@@ -1,0 +1,6 @@
+{
+  "watch": ["bot.js", ".env"],
+  "ignore": ["chat_history.json", "attachments/", "*.txt", "*.pdf", "*.docx"],
+  "ext": "js,json,env",
+  "delay": 500
+}
