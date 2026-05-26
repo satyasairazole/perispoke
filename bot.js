@@ -1062,7 +1062,33 @@ app.get("/debug-webhooks", (req, res) => {
   res.json({ count: data.length, tip: "Add ?all=1 to see all event types", webhooks: data });
 });
 
-// ── Proactively scan all client groups for unprocessed media messages ──
+// Shows raw API response for media messages — helps find the download URL field
+app.get("/debug-media", async (req, res) => {
+  const raw = [];
+  for (const [chatId, groupName] of Object.entries(CLIENT_GROUPS)) {
+    const candidates = [
+      `https://api.periskope.app/v1/chats/${encodeURIComponent(chatId)}/messages?limit=50`,
+      `https://api.periskope.app/v1/messages?chat_id=${encodeURIComponent(chatId)}&limit=50`,
+    ];
+    for (const url of candidates) {
+      try {
+        const r = await axios.get(url, {
+          headers: { Authorization: `Bearer ${PERISKOPE_KEY}`, "x-phone": BOT_PHONE },
+          timeout: 10000,
+        });
+        const msgs = r.data?.messages || r.data?.data || r.data?.items || [];
+        const mediaMsgs = msgs.filter(m =>
+          m.message_type === "document" || m.message_type === "image" || m.has_media === true
+        );
+        for (const m of mediaMsgs) {
+          raw.push({ group: groupName, message_type: m.message_type, full: m });
+        }
+        if (msgs.length) break;
+      } catch (e) { raw.push({ group: groupName, error: e.message }); }
+    }
+  }
+  res.json({ count: raw.length, media_messages: raw });
+});
 app.get("/scan-media", async (req, res) => {
   const results = [];
   const candidates = [
@@ -1187,7 +1213,7 @@ app.get("/", (req, res) => {
 // ────────────────────────────────────────────────────────────
 //  START
 // ────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3010;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("\n╔══════════════════════════════════════════════╗");
   console.log("║   StepOne Smart Bot v5 — RUNNING             ║");
