@@ -291,58 +291,191 @@ async function analyseWordDoc(buffer, filename, senderName, groupName) {
 }
 
 /**
- * Main file analysis entry point — called from webhook handler
+ * Analyse an image via Claude Vision
  */
-async function handleFileAttachment(chatId, clientGroupName, senderName, data) {
-  const mediaUrl  = data.media_url || data.attachment_url || data.url || null;
-  const filename  = data.filename || data.media_filename || data.attachment_name || "attachment";
-  const mimeType  = data.mime_type || data.media_mime_type || "";
+async function analyseImage(base64Data, mimeType, senderName, groupName, caption) {
+  console.log(`🖼️  Analysing image (${mimeType})`);
+  const res = await claude.messages.create({
+    model: "claude-sonnet-4-5",
+    max_tokens: 800,
+    messages: [{
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: { type: "base64", media_type: mimeType, data: base64Data }
+        },
+        {
+          type: "text",
+          text: `This image was sent by "${senderName}" in client group "${groupName}".` +
+                (caption ? ` Caption: "${caption}"` : "") + `\n\n` +
+                `Please provide:\n` +
+                `1. What is shown in the image (describe clearly)\n` +
+                `2. Business context — what is the client likely communicating?\n` +
+                `3. Any text, numbers, dates, or error messages visible in the image\n` +
+                `4. Action items or requests for StepOne\n` +
+                `5. Urgency: high / medium / low\n\n` +
+                `Be concise and business-focused.`
+        }
+      ]
+    }]
+  });
+  return res.content[0].text;
+}
 
+/**
+ * Fetch and analyse a URL / link shared by client
+ */
+async function analyseLink(url, senderName, groupName) {
+  console.log(`🔗 Fetching link: ${url}`);
+  let pageText = "";
+  try {
+    const res = await axios.get(url, {
+      timeout: 15000,
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; StepOneBot/1.0)" },
+      maxContentLength: 500000,
+    });
+    // Strip HTML tags for a rough plain-text extract
+    pageText = res.data
+      .replace(/<script[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .substring(0, 6000);
+  } catch (err) {
+    console.error(`❌ Could not fetch URL ${url}:`, err.message);
+    return `⚠️ Could not read the page at ${url} (${err.message}). Please review manually.`;
+  }
+
+  return await askClaude(
+    [{
+      role: "user",
+      content: `A link was shared by "${senderName}" in client group "${groupName}":\n${url}\n\n` +
+               `Page content (extracted):\n---\n${pageText}\n---\n\n` +
+               `Please provide:\n` +
+               `1. What this page/link is about\n` +
+               `2. Why the client likely shared it — what are they asking or showing?\n` +
+               `3. Any action items for StepOne\n` +
+               `4. Urgency: high / medium / low`
+    }],
+    "You are a business analyst reviewing client-shared links. Be concise.",
+    800
+  );
+}
+
+/**
+ * Extract URLs from a message body
+ */
+function extractUrls(text) {
+  if (!text) return [];
+  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/gi;
+  return [...new Set(text.match(urlRegex) || [])];
+}
+
+/**
+ * Main media/file/link analysis entry point
+ */
+async function handleFileAttachment(chatId, clientGroupName, senderName, data, messageText) {
+  const mediaUrl = data.media_url || null;
+  const filename = data.filename  || "attachment";
+  const mimeType = data.mime_type || "";
+
+  const isPDF   = mimeType.includes("pdf")   || filename.toLowerCase().endsWith(".pdf");
+  const isWord  = mimeType.includes("word")  || filename.toLowerCase().match(/\.docx?$/);
+  const isImage = mimeType.startsWith("image/") ||
+                  /\.(jpe?g|png|gif|webp|bmp|heic)$/i.test(filename);
+
+  // ── Links in message text ────────────────────────────────
+  const urls = extractUrls(messageText || data.caption || "");
+  if (urls.length > 0) {
+    console.log(`🔗 Found ${urls.length} URL(s) in message`);
+    for (const url of urls.slice(0, 3)) {  // max 3 links per message
+      try {
+        const linkAnalysis = await analyseLink(url, senderName, clientGroupName);
+        addToHistory(chatId, "user",
+          `[${senderName} shared link: ${url}]\nAnalysis:\n${linkAnalysis}`);
+        await sendWhatsAppMessage(COMMS_GROUP,
+          `🔗 *Link Shared — ${clientGroupName}*\n` +
+          `👤 From: ${senderName}\n` +
+          `🌐 ${url}\n\n` +
+          `*Analysis:*\n${linkAnalysis.substring(0, 700)}${linkAnalysis.length > 700 ? "\n_(truncated)_" : ""}`
+        );
+      } catch (err) {
+        console.error("❌ Link analysis failed:", err.message);
+      }
+    }
+  }
+
+  // ── No media URL — nothing left to download ──────────────
   if (!mediaUrl) {
-    console.log("⚠️  No media URL found in payload — skipping file analysis");
+    if (urls.length === 0) console.log("⚠️  No media URL and no links found");
     return;
   }
 
-  const isPDF  = mimeType.includes("pdf")  || filename.toLowerCase().endsWith(".pdf");
-  const isWord = mimeType.includes("word") || filename.toLowerCase().match(/\.docx?$/);
-
-  if (!isPDF && !isWord) {
-    console.log(`ℹ️  File type not analysed (${mimeType || filename}) — only PDF/Word supported`);
+  // ── Download the file ────────────────────────────────────
+  let downloaded;
+  try {
+    downloaded = await downloadAttachment(mediaUrl, filename);
+  } catch (err) {
+    console.error("❌ Download failed:", err.message);
+    await sendWhatsAppMessage(COMMS_GROUP,
+      `📎 *File Received — ${clientGroupName}*\n👤 ${senderName} | ${filename}\n⚠️ Download failed — review manually.`
+    );
     return;
   }
+
+  const { filePath, base64, buffer, mimeType: detectedMime } = downloaded;
+  const resolvedMime = mimeType || detectedMime;
+
+  let analysis = "";
+  let icon = "📎";
 
   try {
-    const { filePath, base64, buffer } = await downloadAttachment(mediaUrl, filename);
-    let analysis = "";
+    if (isPDF) {
+      icon = "📄";
+      analysis = await analysePDF(base64, filename, senderName, clientGroupName);
+    } else if (isWord) {
+      icon = "📝";
+      analysis = await analyseWordDoc(buffer, filename, senderName, clientGroupName);
+    } else if (isImage || resolvedMime.startsWith("image/")) {
+      icon = "🖼️";
+      // Normalise mime for Claude (must be image/jpeg, image/png, image/gif, image/webp)
+      const claudeMime = resolvedMime.startsWith("image/") ? resolvedMime : "image/jpeg";
+      const caption = data.caption || messageText || "";
+      analysis = await analyseImage(base64, claudeMime, senderName, clientGroupName, caption);
+    } else {
+      console.log(`ℹ️  Unsupported file type: ${resolvedMime || filename} — logged only`);
+      addToHistory(chatId, "user", `[${senderName} sent unsupported file: ${filename}]`);
+      await sendWhatsAppMessage(COMMS_GROUP,
+        `📎 *File Received — ${clientGroupName}*\n👤 ${senderName}\n📄 ${filename}\n` +
+        `ℹ️ File type not auto-analysed (${resolvedMime || "unknown type"})`
+      );
+      return;
+    }
 
-    if (isPDF)  analysis = await analysePDF(base64, filename, senderName, clientGroupName);
-    if (isWord) analysis = await analyseWordDoc(buffer, filename, senderName, clientGroupName);
+    // Store in history
+    addToHistory(chatId, "user",
+      `[${senderName} sent ${isImage ? "image" : "file"}: ${filename}]\nAnalysis:\n${analysis}`);
 
-    // Store analysis in chat history
-    const historyEntry = `[FILE: ${filename}]\n${analysis}`;
-    addToHistory(chatId, "user", `[${senderName} sent file: ${filename}]\nAnalysis:\n${analysis}`);
-
-    // Save analysis text alongside the file for backup
+    // Save backup
     const analysisPath = filePath.replace(/\.[^.]+$/, "") + "_analysis.txt";
-    fs.writeFileSync(analysisPath, `File: ${filename}\nSender: ${senderName}\nGroup: ${clientGroupName}\nTime: ${nowIST()}\n\n${analysis}`);
+    fs.writeFileSync(analysisPath,
+      `File: ${filename}\nSender: ${senderName}\nGroup: ${clientGroupName}\nTime: ${nowIST()}\n\n${analysis}`);
 
-    // Post to comms group
     const urgencyLine = analysis.toLowerCase().includes("high") ? "🔴 HIGH urgency" : "🟡 Review needed";
     await sendWhatsAppMessage(COMMS_GROUP,
-      `📎 *File Received — ${clientGroupName}*\n` +
+      `${icon} *${isImage ? "Image" : "File"} Received — ${clientGroupName}*\n` +
       `👤 From: ${senderName}\n` +
-      `📄 File: ${filename}\n` +
+      `📄 ${filename}\n` +
       `${urgencyLine}\n\n` +
-      `*Analysis:*\n${analysis.substring(0, 800)}${analysis.length > 800 ? "\n_(truncated — full analysis saved)_" : ""}`
+      `*Analysis:*\n${analysis.substring(0, 800)}${analysis.length > 800 ? "\n_(truncated — full saved)_" : ""}`
     );
+    console.log(`✅ Analysed & backed up: ${filePath}`);
 
-    console.log(`✅ File analysed & backed up: ${filePath}`);
   } catch (err) {
-    console.error("❌ File analysis failed:", err.message);
+    console.error("❌ Analysis failed:", err.message);
     await sendWhatsAppMessage(COMMS_GROUP,
-      `📎 *File Received — ${clientGroupName}*\n` +
-      `👤 From: ${senderName} | File: ${filename}\n` +
-      `⚠️ Auto-analysis failed — please review manually.`
+      `${icon} *${clientGroupName}* — ${filename}\n👤 ${senderName}\n⚠️ Analysis failed: ${err.message}`
     );
   }
 }
@@ -368,6 +501,17 @@ function isTrivialClientMessage(message) {
 //  Auto-reply ONLY for standalone FAQs with no company context needed.
 //  Single-word follow-ups, timeline questions, setup requests → human.
 // ────────────────────────────────────────────────────────────
+const SCHEDULING_KEYWORDS = [
+  "connect","call","meeting","schedule","when","availability","available",
+  "reschedule","slot","time","pm","am","tomorrow","today","catch up",
+  "free","busy","zoom","meet","google meet","teams",
+];
+function isSchedulingQuestion(message) {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  return SCHEDULING_KEYWORDS.some(k => m.includes(k));
+}
+
 function shouldAutoReply(analysis, message) {
   if (!analysis.client_reply)           return false; // Claude gave no reply
   if (analysis.urgency === "high")      return false; // urgent → human
@@ -376,6 +520,8 @@ function shouldAutoReply(analysis, message) {
   if (analysis.confidence !== "high")   return false; // not sure → don't reply
   // Single-word or very short messages are context-dependent — don't guess
   if (message && message.trim().split(/\s+/).length <= 2) return false;
+  // Scheduling/meeting questions always need a human to confirm availability
+  if (isSchedulingQuestion(message))    return false;
   return true;
 }
 
@@ -389,13 +535,20 @@ async function handleClientMessage(chatId, clientGroupName, senderName, message,
   console.log(`   Message: ${message || "(no text)"}`);
 
   // ── File attachment? ─────────────────────────────────────
-  const hasAttachment = !!(data.media_url || data.attachment_url || data.url || data.filename);
+  const hasAttachment = !!(data.media_url || data.filename);
   if (hasAttachment) {
-    await handleFileAttachment(chatId, clientGroupName, senderName, data);
+    await handleFileAttachment(chatId, clientGroupName, senderName, data, message);
     if (!message) return;
   }
 
   if (!message) return;
+
+  // ── Plain text but contains a URL? Analyse the link ─────
+  const inlineUrls = extractUrls(message);
+  if (!hasAttachment && inlineUrls.length > 0) {
+    await handleFileAttachment(chatId, clientGroupName, senderName, data, message);
+    // Continue — also process the message text normally below
+  }
 
   // ── Trivial ack from client? Skip full analysis ──────────
   if (isTrivialClientMessage(message)) {
@@ -757,6 +910,9 @@ async function bootstrapHistory() {
   console.log("✅ Bootstrap complete\n");
 }
 
+// ── Last 10 raw webhook payloads — inspect at /debug-webhooks ─
+const recentWebhooks = [];
+
 // ────────────────────────────────────────────────────────────
 //  WEBHOOK
 // ────────────────────────────────────────────────────────────
@@ -765,6 +921,10 @@ app.post("/webhook", async (req, res) => {
   try {
     const payload   = req.body;
     const eventType = payload.event_type || "";
+
+    // ── Always store raw payload for debugging ───────────────
+    recentWebhooks.unshift({ time: nowIST(), eventType, raw: payload });
+    if (recentWebhooks.length > 10) recentWebhooks.pop();
 
     if (eventType !== "message.created") {
       console.log(`⏭️  Skipped: ${eventType}`);
@@ -777,31 +937,78 @@ app.post("/webhook", async (req, res) => {
     const senderPhone = data.sender_phone || data.from || null;
     const senderName  = data.sender_name || data.pushname || data.contact_name || senderPhone;
     const isFromBot   = data.from_me === true || senderPhone === BOT_PHONE;
-    // ── Dedup: skip if we've already processed this message ID ──
+
+    // ── Dedup ────────────────────────────────────────────────
     const msgId = data.id || data.message_id || null;
-    if (msgId) {
-      if (processedMsgIds.has(msgId)) {
-        console.log(`⏭️  Duplicate msgId ${msgId} — skipped`);
-        return;
-      }
-      processedMsgIds.add(msgId);
-      if (processedMsgIds.size > 500) {
-        const first = processedMsgIds.values().next().value;
-        processedMsgIds.delete(first);
-      }
-      // Remember last message ID per chat for quoting
-      if (chatId) lastMsgId[chatId] = msgId;
+    const dedupKey = msgId ||
+      `${chatId}:${senderPhone}:${(message || "").substring(0, 50)}:${Math.floor(Date.now() / 30000)}`;
+    if (processedMsgIds.has(dedupKey)) {
+      console.log(`⏭️  Duplicate — skipped`);
+      return;
+    }
+    processedMsgIds.add(dedupKey);
+    if (processedMsgIds.size > 500) processedMsgIds.delete(processedMsgIds.values().next().value);
+    if (chatId && msgId) lastMsgId[chatId] = msgId;
+
+    if (isFromBot) { console.log("⏭️  From bot — skipped"); return; }
+    if (!chatId)   { console.log("⏭️  No chatId"); return; }
+
+    // ── Resolve attachment URL across ALL known Periskope field names ──
+    const attachmentUrl =
+      data.media_url          ||
+      data.attachment_url     ||
+      data.url                ||
+      data.document?.url      ||
+      data.document?.link     ||
+      data.media?.url         ||
+      data.file?.url          ||
+      data.image?.url         ||
+      null;
+
+    const attachFilename =
+      data.filename           ||
+      data.media_filename     ||
+      data.attachment_name    ||
+      data.document?.filename ||
+      data.document?.caption  ||
+      data.media?.filename    ||
+      data.file?.name         ||
+      null;
+
+    const attachMime =
+      data.mime_type          ||
+      data.mimetype           ||
+      data.media_mime_type    ||
+      data.document?.mimetype ||
+      data.media?.mimetype    ||
+      "";
+
+    const hasAttachment = !!(attachmentUrl || attachFilename ||
+      data.document || data.media || data.file);
+
+    // ── Log full payload for file messages so we can see actual fields ──
+    if (!message || hasAttachment) {
+      console.log(`\n📎 FILE/MEDIA WEBHOOK — dumping full data to see Periskope fields:`);
+      console.log(JSON.stringify(data, null, 2));
     }
 
-    if (isFromBot)   { console.log("⏭️  From bot — skipped"); return; }
-    if (!chatId)     { console.log("⏭️  No chatId"); return; }
-    if (!message && !data.media_url && !data.attachment_url)
-                     { console.log("⏭️  No message or attachment"); return; }
+    if (!message && !hasAttachment) {
+      console.log("⏭️  No message or attachment");
+      return;
+    }
 
-    console.log(`\n📨 ${chatId} | ${senderName}: ${(message || "(file)").substring(0, 80)}`);
+    console.log(`\n📨 ${chatId} | ${senderName}: ${(message || `(file: ${attachFilename || "unknown"})`).substring(0, 80)}`);
+
+    // Pass normalised attachment fields downstream
+    const normalisedData = {
+      ...data,
+      media_url:  attachmentUrl,
+      filename:   attachFilename || "attachment",
+      mime_type:  attachMime,
+    };
 
     if (CLIENT_GROUPS[chatId]) {
-      await handleClientMessage(chatId, CLIENT_GROUPS[chatId], senderName, message, data, msgId);
+      await handleClientMessage(chatId, CLIENT_GROUPS[chatId], senderName, message, normalisedData, msgId);
     } else if (chatId === COMMS_GROUP) {
       await handleCommsMessage(chatId, senderName, message);
     } else {
@@ -826,6 +1033,11 @@ app.get("/refresh-groups", async (req, res) => {
     groups_after: after,
     client_groups: CLIENT_GROUPS,
   });
+});
+
+// Shows last 10 raw webhook payloads — use after sending a PDF to see exact fields
+app.get("/debug-webhooks", (req, res) => {
+  res.json({ count: recentWebhooks.length, webhooks: recentWebhooks });
 });
 
 app.get("/list-chats", async (req, res) => {
@@ -882,7 +1094,7 @@ app.get("/", (req, res) => {
 // ────────────────────────────────────────────────────────────
 //  START
 // ────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3010;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("\n╔══════════════════════════════════════════════╗");
   console.log("║   StepOne Smart Bot v5 — RUNNING             ║");
