@@ -938,81 +938,99 @@ app.post("/webhook", async (req, res) => {
     const senderName  = data.sender_name || data.pushname || data.contact_name || senderPhone;
     const isFromBot   = data.from_me === true || senderPhone === BOT_PHONE;
 
-    // ── Dedup ────────────────────────────────────────────────
-    const msgId = data.id || data.message_id || null;
-    const dedupKey = msgId ||
+    // ── Fix: data.id is an OBJECT {id,remote,from_me,serialized} — extract the string ──
+    const msgIdStr = data.message_id            // "false_917731066049@c.us_3EB084..."  ✅ string
+      || data.id?.id                            // nested id object → .id string
+      || data.unique_id                         // fallback unique_id field
+      || null;
+
+    // ── Dedup using the real string ID ───────────────────────
+    const dedupKey = msgIdStr ||
       `${chatId}:${senderPhone}:${(message || "").substring(0, 50)}:${Math.floor(Date.now() / 30000)}`;
     if (processedMsgIds.has(dedupKey)) {
-      console.log(`⏭️  Duplicate — skipped`);
+      console.log(`⏭️  Duplicate — skipped (${dedupKey.substring(0, 60)})`);
       return;
     }
     processedMsgIds.add(dedupKey);
     if (processedMsgIds.size > 500) processedMsgIds.delete(processedMsgIds.values().next().value);
-    if (chatId && msgId) lastMsgId[chatId] = msgId;
+    if (chatId && msgIdStr) lastMsgId[chatId] = msgIdStr;
 
     if (isFromBot) { console.log("⏭️  From bot — skipped"); return; }
     if (!chatId)   { console.log("⏭️  No chatId"); return; }
 
-    // ── Resolve attachment URL across ALL known Periskope field names ──
-    const attachmentUrl =
-      data.media_url          ||
-      data.attachment_url     ||
-      data.url                ||
-      data.document?.url      ||
-      data.document?.link     ||
-      data.media?.url         ||
-      data.file?.url          ||
-      data.image?.url         ||
-      null;
+    // ── Detect media messages by message_type ─────────────────
+    // Periskope does NOT include media_url in webhook — must fetch separately
+    const msgType    = data.message_type || data.type || "chat";
+    const isMediaMsg = ["document","image","video","audio","sticker"].includes(msgType)
+                    || data.has_media === true;
 
-    const attachFilename =
-      data.filename           ||
-      data.media_filename     ||
-      data.attachment_name    ||
-      data.document?.filename ||
-      data.document?.caption  ||
-      data.media?.filename    ||
-      data.file?.name         ||
-      null;
+    let attachmentUrl  = data.media_url || data.attachment_url || data.document?.url || data.media?.url || null;
+    let attachFilename = data.filename || data.media_filename || data.document?.filename || null;
+    let attachMime     = data.mime_type || data.mimetype || data.document?.mimetype || data.media?.mimetype || "";
 
-    const attachMime =
-      data.mime_type          ||
-      data.mimetype           ||
-      data.media_mime_type    ||
-      data.document?.mimetype ||
-      data.media?.mimetype    ||
-      "";
-
-    const hasAttachment = !!(attachmentUrl || attachFilename ||
-      data.document || data.media || data.file);
-
-    // ── Log full payload for file messages so we can see actual fields ──
-    if (!message || hasAttachment) {
-      console.log(`\n📎 FILE/MEDIA WEBHOOK — dumping full data to see Periskope fields:`);
-      console.log(JSON.stringify(data, null, 2));
+    // ── Fetch media URL from Periskope if webhook didn't include it ──
+    if (isMediaMsg && !attachmentUrl && msgIdStr) {
+      console.log(`📡 Fetching media URL for ${msgType} message (${msgIdStr})...`);
+      try {
+        // Try known Periskope media endpoints
+        const mediaCandidates = [
+          `https://api.periskope.app/v1/messages/${encodeURIComponent(msgIdStr)}/media`,
+          `https://api.periskope.app/v1/messages/${encodeURIComponent(msgIdStr)}`,
+        ];
+        for (const url of mediaCandidates) {
+          try {
+            const mRes = await axios.get(url, {
+              headers: { Authorization: `Bearer ${PERISKOPE_KEY}`, "x-phone": BOT_PHONE },
+              timeout: 8000,
+            });
+            const md = mRes.data?.data || mRes.data;
+            attachmentUrl  = md?.media_url || md?.url || md?.download_url || md?.link || attachmentUrl;
+            attachFilename = md?.filename  || md?.media_filename || attachFilename;
+            attachMime     = md?.mime_type || md?.mimetype || attachMime;
+            if (attachmentUrl) {
+              console.log(`✅ Got media URL: ${attachmentUrl.substring(0, 60)}...`);
+              break;
+            }
+          } catch (_) { /* try next */ }
+        }
+        if (!attachmentUrl) console.warn(`⚠️  Could not fetch media URL for ${msgIdStr}`);
+      } catch (err) {
+        console.error("❌ Media fetch failed:", err.message);
+      }
     }
 
-    if (!message && !hasAttachment) {
+    // Caption — some media messages have a body alongside the file
+    const caption = message || data.caption || "";
+    const hasAttachment = !!(attachmentUrl || isMediaMsg);
+
+    // ── Log full payload for any media message ────────────────
+    if (isMediaMsg) {
+      console.log(`\n📎 MEDIA MESSAGE (type: ${msgType}) | url: ${attachmentUrl || "none yet"}`);
+      console.log("   Payload keys:", Object.keys(data).join(", "));
+    }
+
+    if (!caption && !hasAttachment) {
       console.log("⏭️  No message or attachment");
       return;
     }
 
-    console.log(`\n📨 ${chatId} | ${senderName}: ${(message || `(file: ${attachFilename || "unknown"})`).substring(0, 80)}`);
+    console.log(`\n📨 ${chatId} | ${senderName}: ${(caption || `(${msgType}: ${attachFilename || "file"})`).substring(0, 80)}`);
 
-    // Pass normalised attachment fields downstream
+    // Build normalised data object
     const normalisedData = {
       ...data,
-      media_url:  attachmentUrl,
-      filename:   attachFilename || "attachment",
-      mime_type:  attachMime,
+      media_url:   attachmentUrl,
+      filename:    attachFilename || (msgType === "image" ? "image.jpg" : msgType === "document" ? "document.pdf" : "file"),
+      mime_type:   attachMime || (msgType === "image" ? "image/jpeg" : msgType === "document" ? "application/pdf" : ""),
+      caption,
     };
 
     if (CLIENT_GROUPS[chatId]) {
-      await handleClientMessage(chatId, CLIENT_GROUPS[chatId], senderName, message, normalisedData, msgId);
+      await handleClientMessage(chatId, CLIENT_GROUPS[chatId], senderName, caption || null, normalisedData, msgIdStr);
     } else if (chatId === COMMS_GROUP) {
-      await handleCommsMessage(chatId, senderName, message);
+      await handleCommsMessage(chatId, senderName, caption || message);
     } else {
-      await handleDirectMessage(chatId, senderName, message);
+      await handleDirectMessage(chatId, senderName, caption || message);
     }
   } catch (err) {
     console.error("❌ WEBHOOK CRASHED:", err.message, err.stack);
