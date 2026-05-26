@@ -910,7 +910,7 @@ async function bootstrapHistory() {
   console.log("✅ Bootstrap complete\n");
 }
 
-// ── Last 10 raw webhook payloads — inspect at /debug-webhooks ─
+// ── Last 50 raw webhook payloads — inspect at /debug-webhooks ─
 const recentWebhooks = [];
 
 // ────────────────────────────────────────────────────────────
@@ -924,7 +924,7 @@ app.post("/webhook", async (req, res) => {
 
     // ── Always store raw payload for debugging ───────────────
     recentWebhooks.unshift({ time: nowIST(), eventType, raw: payload });
-    if (recentWebhooks.length > 10) recentWebhooks.pop();
+    if (recentWebhooks.length > 50) recentWebhooks.pop();
 
     if (eventType !== "message.created") {
       console.log(`⏭️  Skipped: ${eventType}`);
@@ -1053,9 +1053,84 @@ app.get("/refresh-groups", async (req, res) => {
   });
 });
 
-// Shows last 10 raw webhook payloads — use after sending a PDF to see exact fields
+// Shows last 50 raw webhook payloads — use after sending a PDF to see exact fields
 app.get("/debug-webhooks", (req, res) => {
-  res.json({ count: recentWebhooks.length, webhooks: recentWebhooks });
+  // Filter to only message.created events by default, or show all with ?all=1
+  const showAll = req.query.all === "1";
+  const data = showAll ? recentWebhooks :
+    recentWebhooks.filter(w => w.eventType === "message.created");
+  res.json({ count: data.length, tip: "Add ?all=1 to see all event types", webhooks: data });
+});
+
+// ── Proactively scan all client groups for unprocessed media messages ──
+app.get("/scan-media", async (req, res) => {
+  const results = [];
+  const candidates = [
+    (chatId) => `https://api.periskope.app/v1/chats/${encodeURIComponent(chatId)}/messages?limit=50`,
+    (chatId) => `https://api.periskope.app/v1/messages?chat_id=${encodeURIComponent(chatId)}&limit=50`,
+  ];
+
+  for (const [chatId, groupName] of Object.entries(CLIENT_GROUPS)) {
+    let msgs = [];
+    for (const urlFn of candidates) {
+      try {
+        const r = await axios.get(urlFn(chatId), {
+          headers: { Authorization: `Bearer ${PERISKOPE_KEY}`, "x-phone": BOT_PHONE },
+          timeout: 10000,
+        });
+        msgs = r.data?.messages || r.data?.data || r.data?.items || [];
+        if (msgs.length) break;
+      } catch (_) {}
+    }
+
+    // Find media messages not yet analyzed
+    const mediaMessages = msgs.filter(m =>
+      m.message_type === "document" ||
+      m.message_type === "image" ||
+      m.has_media === true ||
+      m.media_url || m.document?.url
+    );
+
+    console.log(`🔍 ${groupName}: ${msgs.length} msgs fetched, ${mediaMessages.length} media found`);
+
+    for (const m of mediaMessages) {
+      const alreadyAnalyzed = (chatHistory[chatId] || [])
+        .some(h => h.content.includes(`[${m.sender_name || m.sender_phone} sent`));
+
+      if (alreadyAnalyzed) {
+        console.log(`⏭️  Already analyzed: ${m.message_id}`);
+        continue;
+      }
+
+      const mediaUrl = m.media_url || m.document?.url || m.image?.url || null;
+      const filename = m.filename || m.document?.filename ||
+        (m.message_type === "image" ? "image.jpg" : "document.pdf");
+      const mimeType = m.mime_type || m.mimetype || m.document?.mimetype ||
+        (m.message_type === "image" ? "image/jpeg" : "application/pdf");
+      const senderName = m.sender_name || m.sender_phone || "Client";
+
+      console.log(`📎 Processing missed media: ${filename} from ${senderName}`);
+      results.push({ group: groupName, file: filename, sender: senderName, url: mediaUrl });
+
+      if (mediaUrl) {
+        const normData = { media_url: mediaUrl, filename, mime_type: mimeType };
+        await handleFileAttachment(chatId, groupName, senderName, normData, m.body || m.caption || "");
+      } else {
+        // No URL in API either — log it
+        results[results.length - 1].status = "no_url_available";
+        console.log(`⚠️  ${filename}: no download URL in API response either`);
+        console.log("   Message keys:", Object.keys(m).join(", "));
+        console.log("   Raw:", JSON.stringify(m, null, 2));
+      }
+    }
+  }
+
+  res.json({
+    status: "scan complete",
+    media_found: results.length,
+    results,
+    tip: results.length === 0 ? "No unanalyzed media found — check terminal logs for raw message data" : "Check comms group for analysis results"
+  });
 });
 
 app.get("/list-chats", async (req, res) => {
