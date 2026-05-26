@@ -51,12 +51,49 @@ if (!fs.existsSync(ATTACHMENTS_DIR)) fs.mkdirSync(ATTACHMENTS_DIR, { recursive: 
 const COMMS_GROUP = "120363408950002751@g.us";
 
 // ── CLIENT GROUPS ─────────────────────────────────────────────
-// Add / remove groups here. Each entry: "whatsapp_group_id": "Friendly Name"
-const CLIENT_GROUPS = {
-  "120363410603753005@g.us": "S1 Client Test",
-  // "120363XXXXXXXXXX@g.us": "Client B",
-  // "120363YYYYYYYYYY@g.us": "Client C",
-};
+// Populated dynamically on startup via discoverClientGroups()
+// Any group the bot is in — except COMMS_GROUP and EXCLUDED_GROUPS — becomes a client group
+let CLIENT_GROUPS = {};   // { chatId: groupName }  — filled at runtime
+
+// Groups to NEVER treat as client groups (add any internal/ops groups here)
+const EXCLUDED_GROUPS = new Set([
+  COMMS_GROUP,
+  // "120363XXXXXXXXXX@g.us",  ← add other internal groups here if needed
+]);
+
+// ── Discover client groups from Periskope API ─────────────────
+async function discoverClientGroups() {
+  console.log("🔍 Discovering client groups from Periskope...");
+  try {
+    const res = await axios.get("https://api.periskope.app/v1/chats", {
+      headers: { Authorization: `Bearer ${PERISKOPE_KEY}`, "x-phone": BOT_PHONE },
+      timeout: 10000,
+    });
+
+    const chats = res.data?.chats || res.data?.data || res.data || [];
+    const groups = chats.filter(c =>
+      c.chat_id?.endsWith("@g.us") && !EXCLUDED_GROUPS.has(c.chat_id)
+    );
+
+    if (groups.length === 0) {
+      console.warn("⚠️  No client groups found — check Periskope API or add groups manually");
+      return;
+    }
+
+    CLIENT_GROUPS = {};
+    for (const g of groups) {
+      CLIENT_GROUPS[g.chat_id] = g.chat_name || g.name || g.chat_id;
+    }
+
+    console.log(`✅ Discovered ${Object.keys(CLIENT_GROUPS).length} client group(s):`);
+    for (const [id, name] of Object.entries(CLIENT_GROUPS)) {
+      console.log(`   📱 ${name} (${id})`);
+    }
+  } catch (err) {
+    console.error("❌ Group discovery failed:", err.response?.data?.message || err.message);
+    console.warn("⚠️  Falling back to hardcoded CLIENT_GROUPS if any are set");
+  }
+}
 
 // ── ADMIN TEAM ───────────────────────────────────────────────
 // specialisations: Claude uses this to pick who to tag
@@ -779,6 +816,18 @@ app.post("/webhook", async (req, res) => {
 //  UTILITY ROUTES
 // ────────────────────────────────────────────────────────────
 
+app.get("/refresh-groups", async (req, res) => {
+  const before = Object.keys(CLIENT_GROUPS).length;
+  await discoverClientGroups();
+  const after = Object.keys(CLIENT_GROUPS).length;
+  res.json({
+    status: "refreshed",
+    groups_before: before,
+    groups_after: after,
+    client_groups: CLIENT_GROUPS,
+  });
+});
+
 app.get("/list-chats", async (req, res) => {
   try {
     const response = await axios.get("https://api.periskope.app/v1/chats", {
@@ -820,7 +869,7 @@ app.get("/", (req, res) => {
     status: "✅ StepOne Bot v5 RUNNING",
     time: nowIST(),
     comms_group: "s1_communication_test",
-    monitoring: Object.values(CLIENT_GROUPS),
+    monitoring: CLIENT_GROUPS,           // shows id → name map
     admins: Object.keys(ADMINS),
     scheduled_summary: "Daily 9:00 AM IST",
     attachments_saved: fs.readdirSync(ATTACHMENTS_DIR).length,
@@ -844,9 +893,10 @@ app.listen(PORT, () => {
   console.log(`📊 Manual summary: http://localhost:${PORT}/summary`);
   console.log(`📎 Attachments  : http://localhost:${PORT}/attachments`);
   console.log(`\n📣 Comms group  : s1_communication_test`);
-  console.log(`👀 Monitoring   : ${Object.values(CLIENT_GROUPS).join(", ")}`);
   console.log(`👥 Admins       : ${Object.keys(ADMINS).join(", ")}`);
   console.log(`⏰ Daily summary : 9:00 AM IST`);
+  console.log(`🔍 Client groups : auto-discovering from Periskope...`);
   console.log(`\n✅ Waiting for messages...\n`);
-  bootstrapHistory();
+  // Discover groups first, then load history for those groups
+  discoverClientGroups().then(() => bootstrapHistory());
 });
