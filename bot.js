@@ -96,20 +96,38 @@ async function discoverClientGroups() {
 }
 
 // ── ADMIN TEAM ───────────────────────────────────────────────
+
+// ── ADMIN TEAM ───────────────────────────────────────────────
 // specialisations: Claude uses this to pick who to tag
 const ADMINS = {
   Satya: {
     phone:          "917731066049@c.us",
-    specialisation: "technical issues, product bugs, API and module queries",
+    specialisation: "technical issues, product bugs, API integrations, platform questions",
   },
-  // Ravi: {
-  //   phone:          "91XXXXXXXXXX@c.us",
-  //   specialisation: "billing, payments, invoices",
-  // },
-  // Priya: {
-  //   phone:          "91YYYYYYYYYY@c.us",
-  //   specialisation: "onboarding, general support, scheduling",
-  // },
+  Rajat: {
+    phone:          "91XXXXXXXXXX@c.us",
+    specialisation: "CEO, executive leadership, strategy, and partnerships",
+  },
+  Tara: {
+    phone:          "91XXXXXXXXXX@c.us",
+    specialisation: "Head of Operations, process building, and client servicing",
+  },
+  Karishma: {
+    phone:          "91XXXXXXXXXX@c.us",
+    specialisation: "Project execution, events navigation, and team logistics",
+  },
+  Neha: {
+    phone:          "91XXXXXXXXXX@c.us",
+    specialisation: "Head of Human Resources, talent acquisition, and employee engagement",
+  },
+  Ayush: {
+    phone:          "91XXXXXXXXXX@c.us",
+    specialisation: "Senior Finance Manager, billing, vendor invoices, and budgets",
+  },
+  Rahul: {
+    phone:          "91XXXXXXXXXX@c.us",
+    specialisation: "Experiential Marketing, fin-tech/automotive activations, and corporate gifting",
+  },
 };
 
 // ── CONSTANTS ────────────────────────────────────────────────
@@ -175,7 +193,7 @@ async function sendWhatsAppMessage(chatId, message, quotedMsgId = null) {
 
 function addToHistory(chatId, role, content) {
   if (!chatHistory[chatId]) chatHistory[chatId] = [];
-  chatHistory[chatId].push({ role, content: `[${nowIST()}] ${content}` });
+  chatHistory[chatId].push({ role, content });
   if (chatHistory[chatId].length > MAX_HISTORY)
     chatHistory[chatId] = chatHistory[chatId].slice(-MAX_HISTORY);
   saveHistory();
@@ -191,7 +209,10 @@ function trackMessage(chatId) {
   return count >= TRAFFIC_THRESHOLD;
 }
 
-async function askClaude(messages, systemPrompt, maxTokens = 700) {
+async function askClaude(messages, systemPromptInput, maxTokens = 700) {
+  let systemPrompt = systemPromptInput;
+  const formattingRule = "CRITICAL FORMATTING: Never use markdown. No asterisks (* or **), no underscores, no bullet dashes (-), no headers (#). URLs must be plain text without any symbols around them. Use numbers for lists. Write like a human texting, not a document.";
+  systemPrompt = formattingRule + "\n\n" + systemPrompt;
   const res = await claude.messages.create({
     model: "claude-sonnet-4-5",
     max_tokens: maxTokens,
@@ -218,9 +239,7 @@ function buildAdminList() {
 async function downloadAttachment(url, filename) {
   const safeFilename = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const filePath = path.join(ATTACHMENTS_DIR, `${Date.now()}_${safeFilename}`);
-  const response = await axios.get(url, { responseType: "arraybuffer", timeout: 30000,
-    headers: { Authorization: `Bearer ${PERISKOPE_KEY}` }
-  });
+  const response = await axios.get(url, { responseType: "arraybuffer", timeout: 30000 });
   fs.writeFileSync(filePath, response.data);
   const base64 = Buffer.from(response.data).toString("base64");
   const mimeType = response.headers["content-type"] || "application/octet-stream";
@@ -251,7 +270,7 @@ async function analysePDF(base64Data, filename, senderName, groupName) {
                 `2. Any action items or requests directed at StepOne\n` +
                 `3. Urgency assessment: high / medium / low\n` +
                 `4. Key numbers, dates, or deadlines mentioned\n\n` +
-                `Be business-focused and concise.`
+                `Be business-focused and concise. Use plain text only, no markdown, no asterisks, no bullet points with dashes.`
         }
       ]
     }]
@@ -284,7 +303,7 @@ async function analyseWordDoc(buffer, filename, senderName, groupName) {
                `3. Urgency: high / medium / low\n` +
                `4. Key numbers, dates, or deadlines mentioned`
     }],
-    "You are a business analyst. Be concise and business-focused.",
+    "You are a business analyst. Be concise and business-focused. Use plain text only, no markdown, no asterisks.",
     1000
   );
   return analysisText;
@@ -315,7 +334,7 @@ async function analyseImage(base64Data, mimeType, senderName, groupName, caption
                 `3. Any text, numbers, dates, or error messages visible in the image\n` +
                 `4. Action items or requests for StepOne\n` +
                 `5. Urgency: high / medium / low\n\n` +
-                `Be concise and business-focused.`
+                `Be concise and business-focused. Use plain text only, no markdown, no asterisks.`
         }
       ]
     }]
@@ -358,7 +377,7 @@ async function analyseLink(url, senderName, groupName) {
                `3. Any action items for StepOne\n` +
                `4. Urgency: high / medium / low`
     }],
-    "You are a business analyst reviewing client-shared links. Be concise.",
+    "You are a business analyst reviewing client-shared links. Be concise. Use plain text only, no markdown, no asterisks.",
     800
   );
 }
@@ -561,7 +580,31 @@ async function handleClientMessage(chatId, clientGroupName, senderName, message,
   const isHeavyTraffic = trackMessage(chatId);
 
   const analysisPrompt =
-`You are StepOne Assistant monitoring WhatsApp client groups.
+`You are a StepOne team assistant helping monitor client WhatsApp groups.
+
+ABOUT STEPONE:
+StepOne (https://steponexp.com) provides end-to-end event technology and management solutions:
+Event Registration, Ticketing, QR Check-in, Badge Printing, Lead Retrieval, Event Apps,
+Kiosks, Event Websites, Booth Design, Event Branding, Video Production, Digital Marketing,
+Exhibitor Management, Delegate Management, Onsite Operations, CRM & API Integrations.
+
+TEAM:
+- Satya (Technical Lead): software, API, platform, technical issues
+- Rajat (CEO): strategy, partnerships, executive decisions
+- Tara (Head of Operations): client servicing, operations, process
+- Karishma (Project Manager): project execution, events, logistics
+- Neha (Head of HR): HR, talent, employee matters
+- Ayush (Senior Finance Manager): billing, invoices, budgets
+- Rahul (Experiential Marketing): marketing activations, corporate gifting
+
+ESCALATION:
+- Technical/software/API → Satya
+- Billing/finance/invoices → Ayush
+- Project/events/logistics → Karishma
+- Operations/client servicing → Tara
+- Marketing/activations → Rahul
+- HR matters → Neha
+- Strategy/partnerships → Rajat
 
 A message arrived in client group "${clientGroupName}":
 Sender: ${senderName}
@@ -659,7 +702,7 @@ async function generateAndPostSummary(chatId, groupName, trigger) {
         `Include: main topics, open questions, action items, any urgency.\n` +
         `Be concise and business-focused.\n\n${recentMsgs}`
       }],
-      "You summarise business WhatsApp conversations concisely.",
+      "You summarise business WhatsApp conversations concisely. Use plain text only, no markdown, no asterisks, no dashes for bullets, use numbers for lists.",
       600
     );
     await sendWhatsAppMessage(COMMS_GROUP,
@@ -739,16 +782,18 @@ async function handleCommsMessage(chatId, senderName, message) {
   }).join("\n\n");
 
   const systemPrompt =
-`You are ${BOT_NAME}, the AI assistant embedded in StepOne's internal WhatsApp comms group.
+`You are a StepOne internal assistant in the team's WhatsApp comms group.
 
 Your role:
 - Team members talk to you naturally — no commands needed
 - "tell her X" / "reply to client saying Y" → compose and SEND that message to the correct client group
 - "who asked about X?" / "what did the client ask?" → search through ALL client history below and answer specifically
 - "summarise" → summarise the relevant conversation from client history
-- "what was in the file?" → check file analysis entries (tagged [FILE:...]) in the history
+- "what was in the file?" → check file analysis entries in the history
 - Be brief and direct — one short paragraph max unless a summary is asked for
+- Use plain text only — no markdown, no asterisks, no dashes for bullets, use numbers for lists
 - NEVER auto-reply to clients unless the team explicitly instructs you to
+- You represent StepOne — always respond professionally and helpfully
 
 Full client group history (search this to answer any question about what clients said):
 ${clientContext}
@@ -819,7 +864,7 @@ Let us know if you have more questions!`;
 // ────────────────────────────────────────────────────────────
 //  CORE: Direct message to bot
 // ────────────────────────────────────────────────────────────
-async function handleDirectMessage(chatId, senderName, message) {
+async function handleDirectMessage(chatId, senderName, message, msgId = null) {
   addToHistory(chatId, "user", `[${senderName}]: ${message}`);
 
   // Build full client context — same as comms handler
@@ -830,18 +875,38 @@ async function handleDirectMessage(chatId, senderName, message) {
 
   const reply = await askClaude(
     chatHistory[chatId].slice(-10),
-    `You are ${BOT_NAME}, personal assistant for the StepOne team.
-You have full access to all client group conversations.
+    `You are a StepOne assistant. You respond on behalf of StepOne to clients and team members.
 
-Client group history:
-${clientContext}
+ABOUT STEPONE:
+Company: StepOne | Website: https://steponexp.com
+Services: Event Registration, Ticketing, QR Check-in, Badge Printing, Lead Retrieval, Event Apps,
+Kiosks, Event Websites, Booth Design, Event Branding, Video Production, Digital Marketing,
+Exhibitor Management, Delegate Management, Onsite Operations, CRM & API Integrations.
 
-Answer questions about clients, summarise conversations, list open items.
-Be concise and direct. No need to ask for the conversation — you already have it above.`
+TEAM:
+- Satya (Technical Lead): software, API, platform, technical issues
+- Rajat (CEO): strategy, partnerships, executive decisions
+- Tara (Head of Operations): client servicing, operations, process
+- Karishma (Project Manager): project execution, events, logistics
+- Neha (Head of HR): HR, talent, employee matters
+- Ayush (Senior Finance Manager): billing, invoices, budgets
+- Rahul (Experiential Marketing): marketing activations, corporate gifting
+
+COMMUNICATION RULES (CRITICAL):
+- Respond like a helpful human team member — warm, natural, concise
+- If asked "are you a bot?" or "are you AI?" → say "I am StepOne Assistant, here to help. How can I assist you?"
+- NEVER say: "I don't know", "I don't have that information", "not in conversation history"
+- INSTEAD say: "Let me check with the team and get back to you" or "I'll connect you with the right person"
+- NEVER expose internal phone numbers — say "I'll connect you with Satya/Ayush/Karishma who can assist"
+- Keep replies short and natural — like a real person texting
+- Use plain text only — no markdown, no asterisks, no bullet dashes, use numbers for lists
+
+Client group history (for context):
+${clientContext}`
   );
 
   addToHistory(chatId, "assistant", reply);
-  await sendWhatsAppMessage(chatId, reply);
+  await sendWhatsAppMessage(chatId, reply, msgId);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -984,9 +1049,9 @@ app.post("/webhook", async (req, res) => {
               timeout: 8000,
             });
             const md = mRes.data?.data || mRes.data;
-            attachmentUrl  = md?.media_url || md?.url || md?.download_url || md?.link || attachmentUrl;
-            attachFilename = md?.filename  || md?.media_filename || attachFilename;
-            attachMime     = md?.mime_type || md?.mimetype || attachMime;
+            attachmentUrl  = md?.media?.path || md?.media_url || md?.url || md?.download_url || md?.link || attachmentUrl;
+            attachFilename = md?.media?.filename || md?.filename || md?.media_filename || attachFilename;
+            attachMime     = md?.media?.mimetype || md?.mime_type || md?.mimetype || attachMime;
             if (attachmentUrl) {
               console.log(`✅ Got media URL: ${attachmentUrl.substring(0, 60)}...`);
               break;
@@ -1030,7 +1095,7 @@ app.post("/webhook", async (req, res) => {
     } else if (chatId === COMMS_GROUP) {
       await handleCommsMessage(chatId, senderName, caption || message);
     } else {
-      await handleDirectMessage(chatId, senderName, caption || message);
+      await handleDirectMessage(chatId, senderName, caption || message, msgIdStr);
     }
   } catch (err) {
     console.error("❌ WEBHOOK CRASHED:", err.message, err.stack);
